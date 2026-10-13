@@ -68,6 +68,9 @@ constexpr uint32_t FRMCOUNT(int p)     { return 0x70040u + (uint32_t)p * 0x1000u
 constexpr uint32_t kGgttSize = 8u << 20;
 constexpr uint64_t kPtePresent = 1, kPteStolen = 2;   // GEN12 GGTT PTE bit 0 valid, bit 1 local (stolen) memory
 constexpr uint64_t kPteAddr = 0x3FFFFFFFF000ull;      // GEN12_GGTT_PTE_ADDR_MASK, bits 45:12
+// Meteor Lake and Arrow Lake can hang when stolen memory is accessed through BAR2 (Intel Wa_22018444074). Firmware that
+// opened stolen memory to the CPU says so in this pcode register (1), and Linux i915 then maps it at DSMBASE instead.
+constexpr uint32_t MTL_PCODE_STOLEN_ACCESS = 0x138914, DSMBASE = 0x1080C0;
 
 // PLANE_CTL (display 11+): enable bit 31, format bits 27:23 (8 = XRGB 8:8:8:8, Linux PLANE_CTL_FORMAT_XRGB_8888 on
 // ICL+), tiling bits 12:10 (0 = linear)
@@ -367,6 +370,15 @@ bool NMIntelFB::start(IOService *provider)
     if (!fMMIO || !ap) { IFBLOG("BAR0 or BAR2 is not mapped - leaving the firmware screen"); OSSafeReleaseNULL(fMMIO); return false; }
     fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
     fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
+    // display 14 only: Lunar Lake (20) has no such erratum, and Linux uses BAR2 there. BAR2 starts at GSMBASE, 8 MB below
+    // DSM, so offsets into it are the same in the direct window.
+    if (fVer == 14 && rd(MTL_PCODE_STOLEN_ACCESS) == 1) {
+        uint64_t dsm = rd64(DSMBASE) & ~0xFFFFFull;   // GEN11_BDSM_MASK, bits 63:20
+        if (dsm >= kGgttSize) {
+            fApertureBase = dsm - kGgttSize;
+            IFBLOG("stolen memory at 0x%llx directly, not through BAR2 (Wa_22018444074)", (unsigned long long)fApertureBase);
+        }
+    }
     if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     if (!IOFramebuffer::start(provider)) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     // Head 4 of the NVIDIA accelerator (NVAccel): WindowServer composites this panel on the NVIDIA card and the

@@ -2,10 +2,11 @@
 // (display versions 12-20: Tiger Lake, Rocket Lake, Alder Lake, Raptor Lake, Meteor Lake, Arrow Lake, Lunar Lake).
 //
 // Phase 1 takes over the mode the firmware already lit: it finds the pipe whose primary plane is scanning out, checks
-// that the plane is linear 32-bit XRGB, and publishes that surface (through the graphics aperture, BAR2 + the plane's GGTT
-// offset) as an IOFramebuffer with the panel's real size and refresh. Nothing is written to the display engine, so a
-// laptop it does not understand keeps exactly the screen it had: start() fails, every reason is logged, and the firmware
-// framebuffer (IONDRVFramebuffer) takes the device as before.
+// that the plane is linear 32-bit XRGB, and publishes that surface (through BAR2: the graphics aperture at the plane's
+// GGTT offset, or on display 14+ stolen memory at the offset the plane's GGTT entry holds) as an IOFramebuffer with the
+// panel's real size and refresh. Nothing is written to the display engine, so a laptop it does not understand keeps
+// exactly the screen it had: start() fails, every reason is logged, and the firmware framebuffer (IONDRVFramebuffer)
+// takes the device as before.
 //
 // Register layout: Linux i915/xe display headers (MIT). Plane 1 of pipe P: PLANE_CTL 0x70180 + P*0x1000, STRIDE +0x08,
 // SIZE +0x10, SURF +0x1C. Transcoder T timings at 0x60000 + T*0x1000, TRANSCONF at 0x70008 + P*0x1000, PIPESRC 0x6001C.
@@ -61,6 +62,12 @@ constexpr uint32_t VSYNC(int t)        { return 0x60014u + (uint32_t)t * 0x1000u
 // one count per vblank (Linux PIPE_FRMCOUNT_G4X, 0x70040 + pipe): counting it is how the real refresh is known without
 // reading the PLL and M/N values back
 constexpr uint32_t FRMCOUNT(int p)     { return 0x70040u + (uint32_t)p * 0x1000u; }
+// Display 14+ (Meteor Lake and later) has no graphics aperture: BAR2 is a plain window onto stolen memory from GSMBASE
+// (the 8 MB GGTT, then DSM), and the GGTT entry of a stolen page holds the page's offset from GSMBASE (Linux xe
+// detect_lmembar_integrated, i915 initial_plane_phys). The GGTT itself is the upper 8 MB of BAR0, 8 bytes per 4 KiB page.
+constexpr uint32_t kGgttSize = 8u << 20;
+constexpr uint64_t kPtePresent = 1, kPteStolen = 2;   // GEN12 GGTT PTE bit 0 valid, bit 1 local (stolen) memory
+constexpr uint64_t kPteAddr = 0x3FFFFFFFF000ull;      // GEN12_GGTT_PTE_ADDR_MASK, bits 45:12
 
 // PLANE_CTL (display 11+): enable bit 31, format bits 27:23 (8 = XRGB 8:8:8:8, Linux PLANE_CTL_FORMAT_XRGB_8888 on
 // ICL+), tiling bits 12:10 (0 = linear)
@@ -133,7 +140,9 @@ private:
     uint8_t fVer = 0;
 
     uint32_t rd(uint32_t off) const { return *(volatile uint32_t *)(fRegs + off); }
+    uint64_t rd64(uint32_t off) const { return rd(off) | ((uint64_t)rd(off + 4) << 32); }
     bool adoptFirmwareMode();
+    bool stolenOffset(int p, uint32_t len);
 
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
@@ -253,6 +262,33 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
     return IOFramebuffer::probe(provider, score);
 }
 
+// Display 14+: replace the plane's GGTT offset in fSurf with its offset in stolen memory (and so in BAR2). The firmware
+// can put the surface anywhere in the 4 GB GGTT (0xff000000 on an Arrow Lake HX laptop, with entries pointing at the start
+// of DSM), so the GGTT offset is no BAR2 offset there. Only one present, contiguous run of stolen pages past the GGTT is
+// taken; anything else leaves the firmware screen.
+bool NMIntelFB::stolenOffset(int p, uint32_t len)
+{
+    uint32_t first = fSurf >> 12, pages = (len + 0xFFFu) >> 12;
+    if (fMMIO->getLength() < 2 * kGgttSize || first + pages > kGgttSize / 8) {
+        IFBLOG("pipe %c: GGTT entries for 0x%x are not in the %llu MiB BAR0", 'A' + p, fSurf, (unsigned long long)(fMMIO->getLength() >> 20));
+        return false;
+    }
+    uint64_t base = rd64(kGgttSize + first * 8) & kPteAddr;
+    for (uint32_t i = 0; i < pages; i++) {
+        uint64_t e = rd64(kGgttSize + (first + i) * 8);
+        if ((e & (kPtePresent | kPteStolen)) != (kPtePresent | kPteStolen) || (e & kPteAddr) != base + (uint64_t)i * 4096) {
+            IFBLOG("pipe %c: GGTT entry %u of the surface is 0x%llx, not one contiguous run of stolen memory", 'A' + p, i, e);
+            return false;
+        }
+    }
+    if (base < kGgttSize || base + len > fApertureLen) {
+        IFBLOG("pipe %c: surface at stolen offset 0x%llx is not in DSM", 'A' + p, base); return false;
+    }
+    IFBLOG("pipe %c: GGTT 0x%x -> stolen offset 0x%llx", 'A' + p, fSurf, base);
+    fSurf = (uint32_t)base;
+    return true;
+}
+
 bool NMIntelFB::adoptFirmwareMode()
 {
     // the panel is on whichever pipe the firmware used; take the first pipe whose transcoder and plane 1 are both on
@@ -268,6 +304,7 @@ bool NMIntelFB::adoptFirmwareMode()
         if (fWidth < 320 || fHeight < 200 || fRowBytes < fWidth * 4) {
             IFBLOG("pipe %c: plane %ux%u stride %u is not a usable surface", 'A' + p, fWidth, fHeight, fRowBytes); return false;
         }
+        if (fVer >= 14 && !stolenOffset(p, fRowBytes * fHeight)) return false;
         if ((uint64_t)fSurf + (uint64_t)fRowBytes * fHeight > fApertureLen) {
             IFBLOG("pipe %c: surface at 0x%x is past the %llu MiB aperture", 'A' + p, fSurf, (unsigned long long)(fApertureLen >> 20)); return false;
         }
